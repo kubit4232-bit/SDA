@@ -1,0 +1,112 @@
+[package]
+name = "sda-core"
+version = "0.1.0"
+edition = "2021"
+description = "Super Download Agent - high-performance segmented download engine"
+authors = ["SDA Project"]
+license = "MIT"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Local time for scheduler
+chrono = { version = "0.4", features = ["serde", "clock"] }
+
+# HTTP client
+reqwest = { version = "0.12", features = ["gzip", "stream"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# UUID for download jobs
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Filesystem
+tokio-util = { version = "0.7", features = ["io"] }
+futures-util = "0.3"
+
+# Windows named pipes (for IPC with browser extension / MsgHost)
+windows = { version = "0.52", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Pipes",
+    "Win32_System_SystemServices",
+    "Win32_System_Threading",
+    "Win32_System_LibraryLoader",
+    "Win32_Security",
+    "Win32_Graphics_Gdi",
+    "Win32_System_Registry",
+    "Win32_System_Com",
+    "Win32_Media_Audio",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Controls",
+    "Win32_UI_Controls_Dialogs",
+    "Win32_UI_Shell_Common",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+# Error handling
+anyhow = "1"
+thiserror = "1"
+
+# Bytes type for stream chunks
+bytes = "1"
+
+# GUI (egui + eframe — IDM-подобный интерфейс, только для sda-gui)
+egui = { version = "0.27", optional = true }
+eframe = { version = "0.27", optional = true }
+futures = "0.3"
+
+# Буфер обмена Windows для вставки ссылок
+arboard = "3"
+
+# SVG рендеринг для иконок
+svg = "0.13"
+image = "0.25"
+resvg = "0.45"
+
+[dev-dependencies]
+tempfile = "3"
+base64 = "0.22"
+
+[build-dependencies]
+embed-resource = "3"
+
+[features]
+default = []
+gui = ["egui", "eframe"]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+
+[[bin]]
+name = "sda"
+path = "src/main.rs"
+
+[[bin]]
+name = "msg_host"
+path = "src/msg_host/main.rs"
+
+[[bin]]
+name = "sda-gui"
+path = "src/gui_main.rs"
+required-features = ["gui"]
+
+[lib]
+name = "sda_core"
+path = "src/lib.rs"

@@ -1,0 +1,6 @@
+/target/
+/build/output/
+/check_errors.txt
+/test_video*.mp4
+*.mp4
+*.tmp

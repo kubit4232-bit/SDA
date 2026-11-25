@@ -1,0 +1,5 @@
+com.sda.agent
+SDA Native Messaging Host
+C:\Program Files\SDA\msg_host.exe
+stdio
+chrome-extension://<ВАШ_ID_РАСШИРЕНИЯ>/
