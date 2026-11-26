@@ -21,7 +21,9 @@ use windows::Win32::System::Registry::{
     RegCloseKey, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW, HKEY,
     HKEY_CURRENT_USER, KEY_READ, KEY_WRITE, REG_SZ,
 };
-use windows::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, GetAsyncKeyState, VK_CONTROL, VK_MENU};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    EnableWindow, GetAsyncKeyState, GetFocus, SetFocus, VK_CONTROL, VK_MENU,
+};
 use windows::Win32::UI::Controls::{
     InitCommonControlsEx, ICC_BAR_CLASSES, ICC_LISTVIEW_CLASSES, ICC_TREEVIEW_CLASSES,
     INITCOMMONCONTROLSEX, LVCF_FMT, LVCF_SUBITEM, LVCF_TEXT, LVCF_WIDTH, LVCFMT_LEFT,
@@ -49,10 +51,10 @@ use windows::Win32::UI::Controls::Dialogs::{
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreateMenu, CreatePopupMenu, CreateWindowExW, DC_HASDEFID, DefWindowProcW,
     DestroyWindow, DispatchMessageW, DrawMenuBar, GetClientRect, GetCursorPos, GetMessageW,
-    GetParent, GetWindowLongPtrW, IsDialogMessageW, KillTimer, LoadCursorW,
+    GetParent, GetWindow, GetWindowLongPtrW, IsDialogMessageW, KillTimer, LoadCursorW,
     LoadIconW, MessageBoxW, PostQuitMessage, RegisterClassExW, SendMessageW, SetForegroundWindow,
     SetMenu, SetTimer, SetWindowLongPtrW, ShowWindow, TrackPopupMenu, TranslateMessage, WNDCLASS_STYLES,
-    WNDCLASSEXW, GWLP_USERDATA, IDC_ARROW, IDI_APPLICATION, MF_POPUP, MF_STRING,
+    WNDCLASSEXW, GWLP_USERDATA, GWL_STYLE, GW_CHILD, GW_HWNDNEXT, IDC_ARROW, IDI_APPLICATION, MF_POPUP, MF_STRING,
     TPM_LEFTALIGN, TPM_RIGHTBUTTON, WM_APP, WM_CONTEXTMENU, HICON, LoadImageW,
     IMAGE_ICON, LR_LOADFROMFILE, IMAGE_FLAGS, ES_AUTOHSCROLL, WS_TABSTOP,
     SW_SHOW, WS_BORDER, WS_CHILD, WS_EX_CLIENTEDGE, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
@@ -1172,6 +1174,87 @@ fn message_box(title: &str, text: &str) {
     }
 }
 
+/// Перевод фокуса по WS_TABSTOP-контролам: наши окна создаются не через
+/// менеджер диалогов, поэтому DefWindowProc не обрабатывает WM_NEXTDLGCTL.
+unsafe fn next_tab_stop(parent: HWND, forward: bool) {
+    let mut stops: Vec<HWND> = Vec::new();
+    let mut child = GetWindow(parent, GW_CHILD);
+    while child.0 != 0 {
+        if (GetWindowLongPtrW(child, GWL_STYLE) & WS_TABSTOP.0 as isize) != 0 {
+            stops.push(child);
+        }
+        child = GetWindow(child, GW_HWNDNEXT);
+    }
+    if stops.is_empty() {
+        return;
+    }
+    let current = GetFocus();
+    let idx = stops.iter().position(|h| *h == current);
+    let next = match idx {
+        Some(i) if forward => (i + 1) % stops.len(),
+        Some(i) => (i + stops.len() - 1) % stops.len(),
+        None => 0,
+    };
+    SetFocus(stops[next]);
+}
+
+unsafe fn handle_next_dlgctl(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if lparam.0 != 0 {
+        SetFocus(HWND(wparam.0 as isize));
+    } else {
+        next_tab_stop(hwnd, wparam.0 == 0);
+    }
+    LRESULT(0)
+}
+
+/// Собственная обработка клавиш модального окна. IsDialogMessageW на обычных
+/// (не dialog-manager) окнах поглощает WM_CHAR и ввод в Edit не работает.
+unsafe fn modal_key(
+    hwnd: HWND,
+    msg: &windows::Win32::UI::WindowsAndMessaging::MSG,
+    multiline: bool,
+) -> bool {
+    if msg.message != windows::Win32::UI::WindowsAndMessaging::WM_KEYDOWN {
+        return false;
+    }
+    match msg.wParam.0 as i32 {
+        9 => {
+            // Tab / Shift+Tab — переход по WS_TABSTOP-контролам.
+            let shift = (GetAsyncKeyState(0x10) as u16) & 0x8000 != 0;
+            SendMessageW(hwnd, 0x0028, WPARAM(if shift { 1 } else { 0 }), LPARAM(0));
+            true
+        }
+        13 if !multiline => {
+            // Enter — нажатие default-кнопки (HIWORD=DC_HASDEFID, LOWORD=ид).
+            let r = SendMessageW(hwnd, 0x0400, WPARAM(0), LPARAM(0)).0 as isize;
+            if (r >> 16) & 0xffff == DC_HASDEFID as isize {
+                let id = r & 0xffff;
+                SendMessageW(hwnd, 0x0111, WPARAM(id as usize), LPARAM(0));
+                true
+            } else {
+                false
+            }
+        }
+        0x56 if (GetAsyncKeyState(VK_CONTROL.0 as i32) as u16) & 0x8000 != 0 => {
+            // Ctrl+V — вставляем текст буфера обмена в фокусированный Edit.
+            if let Ok(mut clip) = arboard::Clipboard::new() {
+                if let Ok(text) = clip.get_text() {
+                    let mut b = wide(&text);
+                    SendMessageW(GetFocus(), 0x000C, WPARAM(0), LPARAM(b.as_mut_ptr() as isize));
+                    return true;
+                }
+            }
+            false
+        }
+        27 => {
+            // Escape — закрытие диалога через WM_CLOSE.
+            SendMessageW(hwnd, 0x0010, WPARAM(0), LPARAM(0));
+            true
+        }
+        _ => false,
+    }
+}
+
 /// Выбор папки через SHBrowseForFolderW (кнопки «Обзор...»).
 unsafe fn browse_folder(owner: HWND) -> Option<String> {
     let title = wide("Выберите папку");
@@ -1255,6 +1338,12 @@ unsafe extern "system" fn input_dlg_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     let state = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut InputDlgState;
+    if msg == 0x0028 {
+        return handle_next_dlgctl(hwnd, wparam, lparam);
+    }
+    if msg == 0x0006 && (wparam.0 & 0xffff) != 0 {
+        if let Some(s) = state.as_mut() { SetFocus(s.h_edit); }
+    }
     match msg {
         windows::Win32::UI::WindowsAndMessaging::WM_COMMAND => {
             if let Some(s) = state.as_mut() {
@@ -1278,7 +1367,7 @@ unsafe extern "system" fn input_dlg_proc(
             if state.as_ref().map(|s| s.multiline).unwrap_or(false) {
                 return LRESULT(0);
             }
-            return LRESULT((DC_HASDEFID as isize) | 1);
+            return LRESULT(((DC_HASDEFID as isize) << 16) | 1);
         }
         windows::Win32::UI::WindowsAndMessaging::WM_CLOSE => {
             if let Some(s) = state.as_mut() { s.done = true; }
@@ -1346,9 +1435,12 @@ unsafe fn text_input_dialog(
     ShowWindow(h, SW_SHOW);
     UpdateWindow(h);
     EnableWindow(parent, FALSE);
+    SetForegroundWindow(h);
+    SetFocus(edit);
+    let multiline = state.multiline;
     let mut msg = std::mem::zeroed();
     while !state.done && GetMessageW(&mut msg, HWND::default(), 0, 0).0 > 0 {
-        if IsDialogMessageW(h, &msg).0 == 0 {
+        if !modal_key(h, &msg, multiline) {
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
@@ -1399,6 +1491,15 @@ unsafe extern "system" fn add_dialog_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     let state = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut AddDialogState;
+    if msg == 0x0028 {
+        return handle_next_dlgctl(hwnd, wparam, lparam);
+    }
+    if msg == 0x0400 {
+        return LRESULT(((DC_HASDEFID as isize) << 16) | 1006); // DM_GETDEFID
+    }
+    if msg == 0x0006 && (wparam.0 & 0xffff) != 0 {
+        if let Some(s) = state.as_mut() { SetFocus(s.h_url); }
+    }
     match msg {
         windows::Win32::UI::WindowsAndMessaging::WM_COMMAND => {
             if let Some(s) = state.as_mut() {
@@ -1428,7 +1529,6 @@ unsafe extern "system" fn add_dialog_proc(
                         }
                     }
                     1173 => message_box("Предосмотр", "Предосмотр доступен для архивов."),
-                    1024 => return LRESULT((DC_HASDEFID as isize) | 1006), // DM_GETDEFID → Начать качать
                     _ => {}
                 }
             }
@@ -1565,11 +1665,12 @@ fn show_add_dialog(parent: HWND) -> Option<AddResult> {
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, &mut state as *mut _ as isize);
         ShowWindow(hwnd, SW_SHOW);
         UpdateWindow(hwnd);
-
         EnableWindow(parent, FALSE);
+        SetForegroundWindow(hwnd);
+        SetFocus(state.h_url);
         let mut msg = std::mem::zeroed();
         while !state.done && GetMessageW(&mut msg, HWND::default(), 0, 0).0 > 0 {
-            if IsDialogMessageW(hwnd, &msg).0 == 0 {
+            if !modal_key(hwnd, &msg, false) {
                 TranslateMessage(&msg);
                 DispatchMessageW(&msg);
             }
@@ -1659,6 +1760,15 @@ unsafe extern "system" fn settings_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     let state = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut SettingsState;
+    if msg == 0x0028 {
+        return handle_next_dlgctl(hwnd, wparam, lparam);
+    }
+    if msg == 0x0400 {
+        return LRESULT(((DC_HASDEFID as isize) << 16) | SIC_OK as isize);
+    }
+    if msg == 0x0006 && (wparam.0 & 0xffff) != 0 {
+        if let Some(s) = state.as_mut() { SetFocus(s.h_out); }
+    }
     match msg {
         windows::Win32::UI::WindowsAndMessaging::WM_COMMAND => {
             if let Some(s) = state.as_mut() {
@@ -1740,7 +1850,6 @@ unsafe extern "system" fn settings_proc(
                             }
                         }
                     }
-                    1024 => return LRESULT((DC_HASDEFID as isize) | SIC_OK as isize), // DM_GETDEFID → ОК
                     _ => {}
                 }
             }
@@ -2179,11 +2288,12 @@ fn show_settings_dialog(parent: HWND, config: &DownloadConfig) -> Option<Downloa
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, &mut state as *mut _ as isize);
         ShowWindow(hwnd, SW_SHOW);
         UpdateWindow(hwnd);
-
         EnableWindow(parent, FALSE);
+        SetForegroundWindow(hwnd);
+        SetFocus(state.h_out);
         let mut msg = std::mem::zeroed();
         while !state.done && GetMessageW(&mut msg, HWND::default(), 0, 0).0 > 0 {
-            if IsDialogMessageW(hwnd, &msg).0 == 0 {
+            if !modal_key(hwnd, &msg, false) {
                 TranslateMessage(&msg);
                 DispatchMessageW(&msg);
             }
@@ -2483,6 +2593,9 @@ unsafe extern "system" fn progress_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lp
         return DefWindowProcW(hwnd, msg, wparam, lparam);
     }
     let state = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut ProgressState;
+    if msg == 0x0028 {
+        return handle_next_dlgctl(hwnd, wparam, lparam);
+    }
     match msg {
         windows::Win32::UI::WindowsAndMessaging::WM_CREATE => {
             if let Some(s) = state.as_mut() {
@@ -2633,6 +2746,15 @@ unsafe fn show_properties(parent: HWND, job: &JobInfo) {
     struct PropState { done: bool, opened: bool, h_save: HWND }
     unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
         let state = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut PropState;
+        if msg == 0x0028 {
+            return handle_next_dlgctl(hwnd, wparam, lparam);
+        }
+        if msg == 0x0400 {
+            return LRESULT(((DC_HASDEFID as isize) << 16) | 1092);
+        }
+        if msg == 0x0006 && (wparam.0 & 0xffff) != 0 {
+            if let Some(s) = state.as_mut() { SetFocus(s.h_save); }
+        }
         match msg {
             windows::Win32::UI::WindowsAndMessaging::WM_COMMAND => {
                 match wparam.0 as i32 & 0xffff {
@@ -2652,7 +2774,6 @@ unsafe fn show_properties(parent: HWND, job: &JobInfo) {
                             }
                         }
                     }
-                    1024 => return LRESULT((DC_HASDEFID as isize) | 1092), // DM_GETDEFID → OK
                     _ => {}
                 }
                 LRESULT(0)
@@ -2727,9 +2848,11 @@ unsafe fn show_properties(parent: HWND, job: &JobInfo) {
     ShowWindow(hwnd, SW_SHOW);
     UpdateWindow(hwnd);
     EnableWindow(parent, FALSE);
+    SetForegroundWindow(hwnd);
+    SetFocus(h_save);
     let mut msg = std::mem::zeroed();
     while !state.done && GetMessageW(&mut msg, HWND::default(), 0, 0).0 > 0 {
-        if IsDialogMessageW(hwnd, &msg).0 == 0 {
+        if !modal_key(hwnd, &msg, false) {
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
